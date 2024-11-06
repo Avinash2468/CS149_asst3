@@ -3,6 +3,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <vector>
+#include <iostream>
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -320,6 +321,7 @@ __global__ void kernelAdvanceSnowflake() {
 __device__ __inline__ void
 shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
 
+
     float diffX = p.x - pixelCenter.x;
     float diffY = p.y - pixelCenter.y;
     float pixelDist = diffX * diffX + diffY * diffY;
@@ -419,11 +421,87 @@ __global__ void kernelRenderCircles() {
     for (int pixelY=screenMinY; pixelY<screenMaxY; pixelY++) {
         float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + screenMinX)]);
         for (int pixelX=screenMinX; pixelX<screenMaxX; pixelX++) {
+            if (pixelX==0 && pixelY==0){
+                printf("YEAHH\n");
+            }
             float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
                                                  invHeight * (static_cast<float>(pixelY) + 0.5f));
             shadePixel(index, pixelCenterNorm, p, imgPtr);
             imgPtr++;
         }
+    }
+}
+
+// kernelRenderPixels -- (CUDA device code)
+//
+// Each thread renders a pixel.  
+__global__ void kernelRenderPixels() {
+
+    int pixelIndex = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (pixelIndex >= (cuConstRendererParams.imageWidth*cuConstRendererParams.imageHeight))
+        return;
+
+    short imageWidth = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
+
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
+
+    int pixelX = pixelIndex/imageWidth;
+    int pixelY = pixelIndex%imageHeight;
+
+    // printf("pixelX: %d, pixelY: %d\n", pixelX, pixelY);
+
+    for(int circleIndex=0; circleIndex<cuConstRendererParams.numCircles; circleIndex++){
+
+        // if(circleIndex==0){
+        //     printf("x:%d, y:%d\n", pixelX, pixelY);
+        // }
+
+        int index3 = 3 * circleIndex;
+
+        // read position and radius
+        float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+        float  rad = cuConstRendererParams.radius[circleIndex];
+
+        short minX = static_cast<short>(imageWidth * (p.x - rad));
+        short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
+        short minY = static_cast<short>(imageHeight * (p.y - rad));
+        short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
+
+        // a bunch of clamps.  Is there a CUDA built-in for this?
+        short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
+        short screenMaxX = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
+        short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
+        short screenMaxY = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
+
+        // if ((pixelX>=screenMinX && pixelX<=screenMaxX) && (pixelY>=screenMinY && pixelY<=screenMaxY)){
+            float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * pixelIndex]);
+            // if (pixelX == 0 && pixelY==0){
+            // printf("BEFORE %f, %f, %f, %f\n", imgPtr->x, imgPtr->y, imgPtr->z, imgPtr->w);
+            // }
+
+            float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelY) + 0.5f),
+                                                    invHeight * (static_cast<float>(pixelX) + 0.5f));
+
+            // if (pixelX == 0 && pixelY==0){
+            //     printf("Inside the 0 condition\n");
+            //     printf("x:%f, y:%f\n", pixelCenterNorm.x, pixelCenterNorm.y);
+            // }
+
+            shadePixel(circleIndex, pixelCenterNorm, p, imgPtr);
+
+            // if (pixelX == 0 && pixelY==0){
+            // printf("AFTER %f, %f, %f, %f\n", imgPtr->x, imgPtr->y, imgPtr->z, imgPtr->w);
+            // }
+        // }
+
+
+
+
+        
+
     }
 }
 
@@ -473,8 +551,6 @@ CudaRenderer::getImage() {
 
     // need to copy contents of the rendered image from device memory
     // before we expose the Image object to the caller
-
-    printf("Copying image data from device\n");
 
     cudaMemcpy(image->data,
                cudaDeviceImageData,
@@ -539,6 +615,11 @@ CudaRenderer::setup() {
     // here would have worked just as well.  See the Programmer's
     // Guide for more information about constant memory.
 
+    // Custom variables
+    int * threadIndexCounter = NULL;
+    cudaMallocManaged(&threadIndexCounter , sizeof(int));
+    // Custom variables
+
     GlobalConstants params;
     params.sceneName = sceneName;
     params.numCircles = numCircles;
@@ -549,6 +630,8 @@ CudaRenderer::setup() {
     params.color = cudaDeviceColor;
     params.radius = cudaDeviceRadius;
     params.imageData = cudaDeviceImageData;
+
+    // std::cout<<"Yo yo homies we are in setup, image width is: "<<params.imageWidth<<" image height is: "<<params.imageHeight<<std::endl;
 
     cudaMemcpyToSymbol(cuConstRendererParams, &params, sizeof(GlobalConstants));
 
@@ -636,10 +719,19 @@ CudaRenderer::advanceAnimation() {
 void
 CudaRenderer::render() {
 
-    // 256 threads per block is a healthy number
-    dim3 blockDim(256, 1);
-    dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
 
-    kernelRenderCircles<<<gridDim, blockDim>>>();
+    // 256 threads per block is a healthy number
+    // dim3 blockDim(256, 1);
+    // dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
+
+    // kernelRenderCircles<<<gridDim, blockDim>>>();
+    // cudaDeviceSynchronize();
+
+    dim3 blockDim(256, 1);
+    dim3 gridDim(((image->width*image->height) + blockDim.x - 1) / blockDim.x);
+
+    kernelRenderPixels<<<gridDim, blockDim>>>();
     cudaDeviceSynchronize();
+
+    
 }
